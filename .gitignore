@@ -1,5 +1,11 @@
 models/
+checkpoints/
 runs/
+wandb/
+venv/
 __pycache__/
 *.pyc
+*.npy
 .DS_Store
+routing_edits.json
+strong_edit_*.json
