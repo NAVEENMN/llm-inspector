@@ -836,6 +836,7 @@ class LiveSimulation(Simulation):
         self.interventions = {}  # (block, head, token) -> edited_ctrl_pts list
         self.original_predictions = None  # top-5 before intervention
         self.modified_predictions = None  # top-5 after intervention
+        self.sensitivity = {}  # {block: {head: score}} — computed on demand
         # Model config (populated after load)
         self.num_q_heads = 32
         self.num_kv_heads = 8
@@ -1076,22 +1077,23 @@ class LiveSimulation(Simulation):
         nkv = self.model.config.num_key_value_heads  # 8
         hd = self.model.config.head_dim              # 64
 
-        for prefix, key, total, n_heads in [("Q", "q_raw", 32, nh), ("K", "k_raw", 8, nkv), ("V", "v_raw", 8, nkv)]:
+        hidden_dim = self.model.config.hidden_size
+        for prefix, key, n_heads in [("Q", "q_raw", nh), ("K", "k_raw", nkv), ("V", "v_raw", nkv)]:
             if key in cap:
                 raw = cap[key]  # (1, seq, total_dim)
                 tensor = raw[0].view(S, n_heads, hd)  # (seq, heads, dim)
-                for h in range(total):
+                for h in range(n_heads):
                     name = f"{prefix}_{subscript(h)}"
-                    head_data = tensor[:, h, :]  # (seq, 64)
+                    head_data = tensor[:, h, :]  # (seq, head_dim)
                     stats_mean = head_data.mean().item()
                     stats_std = head_data.std().item()
                     d[name] = [
                         ("Weight Matrix (FIXED)", [
-                            f"Shape: (2048, 64)",
-                            f"Head {h} of {total}",
+                            f"Shape: ({hidden_dim}, {hd})",
+                            f"Head {h} of {n_heads}",
                         ]),
                         ("Activations (REAL)", [
-                            f"Output: (1, {S}, 64)",
+                            f"Output: (1, {S}, {hd})",
                             f"Mean: {stats_mean:.6f}",
                             f"Std:  {stats_std:.6f}",
                         ] + self._fmt_tensor(head_data)),
@@ -1333,6 +1335,85 @@ class LiveSimulation(Simulation):
         d["_next_token"] = self._top_tokens
 
         self.data = d
+
+    def compute_sensitivity(self):
+        """Compute which (layer, head) spline curves are most sensitive.
+
+        For each block, perturbs each head's control points slightly
+        and measures the change in next-token prediction. Fast — one
+        forward pass per block (not per head).
+
+        Stores results in self.sensitivity and prints ranked list.
+        """
+        import torch
+        if not self.is_manifold or not self.text:
+            print("  Need manifold model + text first.")
+            return
+
+        self._ensure_model()
+        ids = self.tokenizer.encode(self.text, return_tensors="pt").to(self.device)
+        nh = self.model.config.num_attention_heads
+        hd = self.model.config.head_dim
+        eps = 0.1  # perturbation magnitude
+
+        # Baseline: clean forward pass
+        with torch.no_grad():
+            base_logits = self.model(ids, use_cache=False).logits[0, -1, :]
+            base_probs = torch.softmax(base_logits.float(), dim=-1)
+
+        self.sensitivity = {}
+        all_scores = []
+
+        print(f"\n  Computing sensitivity ({len(self.patched_blocks)} blocks, {nh} heads)...")
+
+        for bi in sorted(self.patched_blocks):
+            ca = self.model.model.layers[bi].self_attn.curve_attention
+            orig_eval = ca.eval_curve
+            self.sensitivity[bi] = {}
+
+            for h in range(nh):
+                # Perturb head h's control points
+                def make_perturbed(orig, head, epsilon):
+                    def perturbed(coeffs, tau_01):
+                        if coeffs.dim() == 4 and coeffs.shape[1] > head:
+                            c = coeffs.clone()
+                            c[:, head, :, :] += epsilon
+                            return orig(c, tau_01)
+                        return orig(coeffs, tau_01)
+                    return perturbed
+
+                ca.eval_curve = make_perturbed(orig_eval, h, eps)
+
+                with torch.no_grad():
+                    pert_logits = self.model(ids, use_cache=False).logits[0, -1, :]
+                    pert_probs = torch.softmax(pert_logits.float(), dim=-1)
+
+                # KL divergence as sensitivity measure
+                kl = (base_probs * (base_probs.log() - pert_probs.log())).sum().item()
+                score = abs(kl) / eps
+                self.sensitivity[bi][h] = score
+                all_scores.append((bi, h, score))
+
+            ca.eval_curve = orig_eval
+
+        # Rank and print
+        all_scores.sort(key=lambda x: x[2], reverse=True)
+
+        print(f"\n  {'Rank':>4s}  {'Layer':>5s}  {'Head':>4s}  {'Sensitivity':>11s}  {'Bar'}")
+        print(f"  {'─'*4}  {'─'*5}  {'─'*4}  {'─'*11}  {'─'*20}")
+
+        max_score = all_scores[0][2] if all_scores else 1.0
+        for rank, (bi, h, score) in enumerate(all_scores[:20]):
+            bar_len = int(20 * score / max_score)
+            bar = '█' * bar_len + '░' * (20 - bar_len)
+            print(f"  {rank+1:>4d}  {bi:>5d}  {h:>4d}  {score:>11.6f}  {bar}")
+
+        if all_scores:
+            top_bi, top_h, _ = all_scores[0]
+            print(f"\n  Most sensitive: Layer {top_bi}, Head {top_h}")
+            print(f"  Select it: click block {top_bi}, then head {top_h}")
+
+        return all_scores
 
     def _apply_all_interventions(self):
         """Patch all blocks that have interventions. Returns list of (ca, orig_eval) to restore."""
@@ -1797,7 +1878,8 @@ class LeftPanel:
         pygame.draw.line(screen, (50, 52, 60), (self.width, top), (self.width, H), 1)
 
         y = top + 10
-        screen.blit(self.fonts["t"].render("LLaMA 3.2-1B", True, (220, 220, 230)), (12, y))
+        model_name = self.model_label if hasattr(self, 'model_label') else "Model"
+        screen.blit(self.fonts["t"].render(model_name, True, (220, 220, 230)), (12, y))
         y += 26
 
         # Block selector — grid of numbered buttons
@@ -2807,6 +2889,8 @@ Commands (type in terminal while inspector runs):
             return {"action": "quit"}
         if cmd == "status":
             return {"action": "status"}
+        if cmd in ("sensitivity", "sens"):
+            return {"action": "sensitivity"}
         if cmd in ("list", "ls"):
             return {"action": "list"}
 
@@ -2880,16 +2964,16 @@ class Inspector:
         self.cam = IsoCamera(self.W, self.H)
         self.renderer = Renderer(self.screen, self.cam, self.fonts)
         self.top_bar = TopBar(self.fonts)
+        self.model_label = os.path.basename(model_path) if model_path else "No model"
+        self.mode_label = "manifold" if checkpoint_path else "standard"
         self.left_panel = LeftPanel(260, self.fonts)
+        self.left_panel.model_label = self.model_label
         self.right_panel = RightPanel(320, self.fonts)
         self.simulation = LiveSimulation(model_path, checkpoint_path)
         self.model_path = model_path
         self.checkpoint_path = checkpoint_path
         self.sel = 0
-
-        model_label = os.path.basename(model_path) if model_path else "No model"
-        mode = "manifold" if checkpoint_path else "standard"
-        pygame.display.set_caption(f"Inspector — {model_label} ({mode})")
+        pygame.display.set_caption(f"Inspector — {self.model_label} ({self.mode_label})")
 
         # Run ID and directory
         self.run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -2918,7 +3002,7 @@ class Inspector:
         self.comps, self.conns = self.blocks[idx]
         self.comp_rects = [None] * len(self.comps)
         self.sel = 0
-        pygame.display.set_caption(f"LLaMA 3.2-1B — Block {idx} — Isometric Inspector")
+        pygame.display.set_caption(f"{self.model_label} ({self.mode_label}) — Block {idx}")
 
     def handle_input(self):
         # Only process camera keys when text input is NOT focused
@@ -3353,6 +3437,12 @@ class Inspector:
             elif act == "quit":
                 return False
 
+            elif act == "sensitivity":
+                if self.simulation.text:
+                    self.simulation.compute_sensitivity()
+                else:
+                    print("  Run a prompt first, then type 'sensitivity'")
+
             elif act == "status":
                 bi = self.left_panel.current_block
                 sh = self.simulation.selected_head
@@ -3494,8 +3584,8 @@ class Inspector:
 
             c = self.cam
             pygame.display.set_caption(
-                f"Block {self.left_panel.current_block} | "
-                f"ax={c.ax:.0f} ay={c.ay:.0f} zoom={c.zoom:.2f} px={c.px:.0f} py={c.py:.0f}")
+                f"{self.model_label} ({self.mode_label}) — Block {self.left_panel.current_block} | "
+                f"ax={c.ax:.0f} ay={c.ay:.0f} zoom={c.zoom:.2f}")
             pygame.display.flip()
             self.clock.tick(60)
         pygame.quit()
