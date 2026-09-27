@@ -877,9 +877,13 @@ class LiveSimulation(Simulation):
         self.intermediate_dim = cfg.intermediate_size
         self.num_layers = cfg.num_hidden_layers
 
+        # Detect if instruct model (has chat template)
+        self.is_instruct = hasattr(self.tokenizer, 'chat_template') and self.tokenizer.chat_template is not None
+        mode_str = "instruct" if self.is_instruct else "base"
+
         print(f"Loaded on {self.device}: {self.num_layers} layers, "
               f"{self.num_q_heads}Q/{self.num_kv_heads}KV heads, "
-              f"dim={self.hidden_dim}, ff={self.intermediate_dim}")
+              f"dim={self.hidden_dim}, ff={self.intermediate_dim} ({mode_str})")
 
         # Load curve attention checkpoint if provided
         if self.checkpoint_path:
@@ -997,6 +1001,15 @@ class LiveSimulation(Simulation):
             h.remove()
         self._hooks = []
 
+    def _encode(self, text):
+        """Encode text, applying chat template for instruct models."""
+        if self.is_instruct:
+            messages = [{"role": "user", "content": text}]
+            formatted = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+            return self.tokenizer.encode(formatted, return_tensors="pt")
+        return self.tokenizer.encode(text, return_tensors="pt")
+
     def run(self, text, block_idx=0):
         import torch
         self._ensure_model()
@@ -1006,7 +1019,7 @@ class LiveSimulation(Simulation):
             self.data = {}
             return
 
-        ids = self.tokenizer.encode(self.text, return_tensors="pt").to(self.device)
+        ids = self._encode(self.text).to(self.device)
         self.token_ids = ids[0].tolist()
         self.tokens = [self.tokenizer.decode([tid]) for tid in self.token_ids]
         self.seq_len = len(self.tokens)
@@ -1348,7 +1361,7 @@ class LiveSimulation(Simulation):
             return
 
         self._ensure_model()
-        ids = self.tokenizer.encode(self.text, return_tensors="pt").to(self.device)
+        ids = self._encode(self.text).to(self.device)
         nh = self.model.config.num_attention_heads
         hd = self.model.config.head_dim
         eps = 0.1  # perturbation magnitude
@@ -1467,7 +1480,7 @@ class LiveSimulation(Simulation):
         full = text
         if self.generated_tokens:
             full = text + " " + " ".join(self.generated_tokens)
-        ids = self.tokenizer.encode(full, return_tensors="pt").to(self.device)
+        ids = self._encode(full).to(self.device)
 
         patches = self._apply_all_interventions()
 
@@ -1489,7 +1502,7 @@ class LiveSimulation(Simulation):
         self._ensure_model()
         self.generated_tokens = []
         self.gen_step = 0
-        ids = self.tokenizer.encode(text, return_tensors="pt").to(self.device)
+        ids = self._encode(text).to(self.device)
 
         patches = self._apply_all_interventions()
 
@@ -1513,7 +1526,7 @@ class LiveSimulation(Simulation):
         import torch
         self._ensure_model()
 
-        ids = self.tokenizer.encode(text, return_tensors="pt").to(self.device)
+        ids = self._encode(text).to(self.device)
 
         # 1. Original forward (clean)
         with torch.no_grad():
