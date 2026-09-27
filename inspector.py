@@ -687,37 +687,34 @@ class Simulation:
     def _build_attn_sections(self):
         """Build Softmax display sections dynamically based on selected_head."""
         h = self.selected_head
+        nh = len(self.attn_mats)
         sections = [
             ("Operation", [
                 "w = softmax(scores, dim=-1)",
-                f"32 heads, each {self.seq_len}x{self.seq_len}",
+                f"{nh} heads, each {self.seq_len}x{self.seq_len}",
             ]),
             (f"Head {h} Attention (click below to change)", [], {
                 "matrix": self.attn_mats[h], "tokens": self.tokens,
                 "label": f"Head {h} — real attention weights",
                 "cmap": "heat"}),
-            ("All 32 Heads (0-7)", [], {
-                "multi": [self.attn_mats[i] for i in range(8)],
-                "tokens": self.tokens, "label": "Click a head to inspect",
-                "head_offset": 0}),
-            ("Heads 8-15", [], {
-                "multi": [self.attn_mats[i] for i in range(8, 16)],
-                "tokens": self.tokens, "label": "",
-                "head_offset": 8}),
-            ("Heads 16-23", [], {
-                "multi": [self.attn_mats[i] for i in range(16, 24)],
-                "tokens": self.tokens, "label": "",
-                "head_offset": 16}),
-            ("Heads 24-31", [], {
-                "multi": [self.attn_mats[i] for i in range(24, 32)],
-                "tokens": self.tokens, "label": "",
-                "head_offset": 24}),
-            ("Statistics", [
+        ]
+        # Show heads in groups of 8
+        for group_start in range(0, nh, 8):
+            group_end = min(group_start + 8, nh)
+            label = f"Heads {group_start}-{group_end-1}"
+            if group_start == 0:
+                label += " (click to inspect)"
+            sections.append((label, [], {
+                "multi": [self.attn_mats[i] for i in range(group_start, group_end)],
+                "tokens": self.tokens,
+                "label": "Click a head to inspect" if group_start == 0 else "",
+                "head_offset": group_start}))
+        sections.append(("Statistics", [
                 f"Selected head: {h}",
                 f"Max attention: {self._attn_stats.get('max', 0):.4f}",
                 f"Min non-zero:  {self._attn_stats.get('min_nonzero', 0):.6f}",
-            ]),
-        ]
+            ]))
+
         return sections
 
     def _build_curve_sections(self):

@@ -1,5 +1,7 @@
 torch
 transformers
+datasets
+accelerate
 pygame
 numpy
 inkan
