@@ -688,13 +688,14 @@ class Simulation:
         """Build Softmax display sections dynamically based on selected_head."""
         h = self.selected_head
         nh = len(self.attn_mats)
+        disp_tokens = getattr(self, 'display_tokens', None) or self.tokens
         sections = [
             ("Operation", [
                 "w = softmax(scores, dim=-1)",
-                f"{nh} heads, each {self.seq_len}x{self.seq_len}",
+                f"{nh} heads, each {len(disp_tokens)}x{len(disp_tokens)}",
             ]),
             (f"Head {h} Attention (click below to change)", [], {
-                "matrix": self.attn_mats[h], "tokens": self.tokens,
+                "matrix": self.attn_mats[h], "tokens": disp_tokens,
                 "label": f"Head {h} — real attention weights",
                 "cmap": "heat"}),
         ]
@@ -706,7 +707,7 @@ class Simulation:
                 label += " (click to inspect)"
             sections.append((label, [], {
                 "multi": [self.attn_mats[i] for i in range(group_start, group_end)],
-                "tokens": self.tokens,
+                "tokens": disp_tokens,
                 "label": "Click a head to inspect" if group_start == 0 else "",
                 "head_offset": group_start}))
         sections.append(("Statistics", [
@@ -797,13 +798,14 @@ class Simulation:
             return self._build_curve_sections()
         if val == "ATTN_WV":
             h = self.selected_head
+            disp_tok = getattr(self, 'display_tokens', None) or self.tokens
             return [
                 ("Operation", [
                     "out = attn_weights @ V",
                     f"Using head {h} weights",
                 ]),
                 (f"Head {h} Attention Used", [], {
-                    "matrix": self.attn_mats.get(h, []), "tokens": self.tokens,
+                    "matrix": self.attn_mats.get(h, []), "tokens": disp_tok,
                     "label": f"These weights multiplied V (head {h})",
                     "cmap": "heat"}),
             ]
@@ -1002,13 +1004,57 @@ class LiveSimulation(Simulation):
         self._hooks = []
 
     def _encode(self, text):
-        """Encode text, applying chat template for instruct models."""
+        """Encode text, applying chat template for instruct models.
+        Sets self.prompt_start and self.prompt_end for display slicing."""
         if self.is_instruct:
             messages = [{"role": "user", "content": text}]
             formatted = self.tokenizer.apply_chat_template(
                 messages, tokenize=False, add_generation_prompt=True)
-            return self.tokenizer.encode(formatted, return_tensors="pt")
+            full_ids = self.tokenizer.encode(formatted, return_tensors="pt")
+            # Find where user text starts and ends
+            user_ids = self.tokenizer.encode(text, add_special_tokens=False)
+            full_list = full_ids[0].tolist()
+            self.prompt_start = 0
+            self.prompt_end = len(full_list)
+            for start in range(len(full_list) - len(user_ids) + 1):
+                if full_list[start:start + len(user_ids)] == user_ids:
+                    self.prompt_start = start
+                    self.prompt_end = start + len(user_ids)
+                    break
+            return full_ids
+        self.prompt_start = 0
+        self.prompt_end = None  # means use all
         return self.tokenizer.encode(text, return_tensors="pt")
+
+    def _run_with_ids(self, ids, original_text, block_idx=0):
+        """Run with pre-encoded IDs (avoids double-encoding for run_all)."""
+        import torch
+        self.text = original_text.strip()
+        ids = ids.to(self.device)
+        self.token_ids = ids[0].tolist()
+        self.tokens = [self.tokenizer.decode([tid]) for tid in self.token_ids]
+
+        # Use the prompt_start/end from the original _encode call
+        self.display_start = getattr(self, 'prompt_start', 0)
+        self.display_end = len(self.tokens)  # include generated tokens
+        self.display_tokens = self.tokens[self.display_start:]
+        if self.display_start > 0:
+            print(f"  [instruct] Showing tokens {self.display_start}+ "
+                  f"of {len(self.tokens)} (prompt: {self.display_tokens[:5]}...)")
+        self.seq_len = len(self.tokens)
+        self.active = True
+
+        self._install_hooks(block_idx)
+        with torch.no_grad():
+            outputs = self.model(ids)
+        self._remove_hooks()
+
+        logits = outputs.logits[0, -1]
+        probs = torch.softmax(logits, dim=-1)
+        top_ids = torch.topk(probs, 5)
+        self._top_tokens = [(self.tokenizer.decode([tid]), p.item())
+                            for tid, p in zip(top_ids.indices, top_ids.values)]
+        self._build_display(block_idx)
 
     def run(self, text, block_idx=0):
         import torch
@@ -1022,6 +1068,14 @@ class LiveSimulation(Simulation):
         ids = self._encode(self.text).to(self.device)
         self.token_ids = ids[0].tolist()
         self.tokens = [self.tokenizer.decode([tid]) for tid in self.token_ids]
+
+        # For display: only show user prompt tokens (skip system template + suffix)
+        self.display_start = getattr(self, 'prompt_start', 0)
+        self.display_end = getattr(self, 'prompt_end', None) or len(self.tokens)
+        self.display_tokens = self.tokens[self.display_start:self.display_end]
+        if self.display_start > 0:
+            print(f"  [instruct] Showing tokens {self.display_start}:{self.display_end} "
+                  f"of {len(self.tokens)} ({self.display_tokens})")
         self.seq_len = len(self.tokens)
         self.active = True
 
@@ -1134,33 +1188,38 @@ class LiveSimulation(Simulation):
             scores.masked_fill_(causal.unsqueeze(0), float('-inf'))
             attn_w = torch.softmax(scores, dim=-1)
 
+            # Slice attention to show only user prompt tokens
+            ds = getattr(self, 'display_start', 0)
+            de = getattr(self, 'display_end', S)
+            disp_tokens = self.tokens[ds:de]
+
             score_mat = []
-            for i in range(S):
+            for i in range(ds, de):
                 row = []
-                for j in range(S):
+                for j in range(ds, de):
                     v = scores[0, i, j].item()
                     row.append(None if v == float('-inf') else v)
                 score_mat.append(row)
 
             d["QKt/d"] = [
                 ("Operation", [
-                    f"scores = Q * Kt / sqrt(64)",
+                    f"scores = Q * Kt / sqrt({hd})",
                     f"Block {block_idx}, causal masked",
                 ]),
                 ("Activations (REAL)", [
-                    f"Shape: (1, 32, {S}, {S})",
+                    f"Shape: (1, {nh}, {S}, {S})",
                 ]),
                 ("Score Heatmap (head 0)", [], {
-                    "matrix": score_mat, "tokens": self.tokens,
+                    "matrix": score_mat, "tokens": disp_tokens,
                     "label": "Raw scores (pre-softmax)", "cmap": "diverge"}),
             ]
 
-            # Attention weights — all 32 heads
+            # Attention weights — show only user prompt region
             self.attn_mats = {}
             for h in range(nh):
                 mat = []
-                for i in range(S):
-                    row = [attn_w[h, i, j].item() for j in range(S)]
+                for i in range(ds, de):
+                    row = [attn_w[h, i, j].item() for j in range(ds, de)]
                     mat.append(row)
                 self.attn_mats[h] = mat
 
@@ -1477,10 +1536,14 @@ class LiveSimulation(Simulation):
             return None
         import torch
         self._ensure_model()
-        full = text
+
+        # Build IDs: template + user text + generated so far
+        ids = self._encode(text).to(self.device)
         if self.generated_tokens:
-            full = text + " " + " ".join(self.generated_tokens)
-        ids = self._encode(full).to(self.device)
+            gen_ids = self.tokenizer.encode(
+                " ".join(self.generated_tokens), add_special_tokens=False,
+                return_tensors="pt").to(self.device)
+            ids = torch.cat([ids, gen_ids], dim=-1)
 
         patches = self._apply_all_interventions()
 
@@ -1493,8 +1556,10 @@ class LiveSimulation(Simulation):
         tok = self.tokenizer.decode([next_id])
         self.generated_tokens.append(tok.strip())
         self.gen_step += 1
-        full_new = text + " " + " ".join(self.generated_tokens)
-        self.run(full_new, block_idx=0)
+
+        # Append new token to IDs and re-run display (no double-encoding)
+        new_ids = torch.cat([ids, torch.tensor([[next_id]], device=self.device)], dim=-1)
+        self._run_with_ids(new_ids, text, block_idx=0)
         return tok.strip()
 
     def run_all(self, text, max_tokens):
@@ -1503,6 +1568,7 @@ class LiveSimulation(Simulation):
         self.generated_tokens = []
         self.gen_step = 0
         ids = self._encode(text).to(self.device)
+        prompt_len = ids.shape[1]
 
         patches = self._apply_all_interventions()
 
@@ -1514,12 +1580,11 @@ class LiveSimulation(Simulation):
 
         self._restore_patches(patches)
 
-        gen_ids = out[0, ids.shape[1]:]
+        gen_ids = out[0, prompt_len:]
         self.generated_tokens = [self.tokenizer.decode([tid]).strip() for tid in gen_ids]
         self.gen_step = len(self.generated_tokens)
-        # Run final state through hooks
-        full = self.tokenizer.decode(out[0], skip_special_tokens=True)
-        self.run(full, block_idx=0)
+        # Run full output through hooks — pass raw IDs to avoid double-encoding
+        self._run_with_ids(out, text, block_idx=0)
 
     def run_with_intervention(self, text, block_idx, head, token_idx, edited_coeffs):
         """Re-run forward pass with and without intervention. Returns (orig, mod) top predictions."""
@@ -1896,9 +1961,9 @@ class LeftPanel:
         screen.blit(self.fonts["m"].render("Block:", True, (150, 150, 160)), (12, y + 2))
         self.click_zones = []
         bx = 60
-        btn_w = 24
-        btn_h = 20
-        cols = 8
+        btn_w = 38
+        btn_h = 22
+        cols = 4
         for b in range(self.NUM_BLOCKS):
             col_i = b % cols
             row_i = b // cols

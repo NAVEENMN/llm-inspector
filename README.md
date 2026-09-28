@@ -19,15 +19,25 @@ Requires Python 3.9+ and a HuggingFace account with access to gated models (e.g.
 ## Quick Start
 
 ```bash
-# Download model + curve attention checkpoint
-python download_model.py meta-llama/Llama-3.2-1B-Instruct
+# Download Manifold 1.0 (base model + manifold checkpoint)
+python download_model.py nmysore/manifold-1.0-1b
 
-# Run inspector (standard mode)
-python inspector.py --model models/Llama-3.2-1B-Instruct
-
-# Run inspector (manifold mode — with B-spline curve attention)
+# Run inspector with manifold attention
 python inspector.py --model models/Llama-3.2-1B-Instruct \
   --checkpoint checkpoints/formation.pt
+```
+
+The manifold checkpoint is hosted at [nmysore/manifold-1.0-1b](https://huggingface.co/nmysore/manifold-1.0-1b) on HuggingFace. The download script fetches both the base LLaMA model and the manifold parameters automatically.
+
+### Other models
+
+```bash
+# Any HuggingFace model (standard mode, no manifold)
+python download_model.py meta-llama/Llama-3.2-1B-Instruct
+python inspector.py --model models/Llama-3.2-1B-Instruct
+
+python download_model.py gpt2
+python inspector.py --model models/gpt2
 ```
 
 ## What is Manifold Mode?
