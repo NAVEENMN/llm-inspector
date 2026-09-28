@@ -1484,6 +1484,43 @@ class LiveSimulation(Simulation):
 
         return all_scores
 
+    def scale_head(self, block_idx, head_idx, scale):
+        """Scale a specific head's control points during generation.
+
+        Unlike static interventions, this scales dynamically — works
+        correctly during autoregressive generation.
+        """
+        if block_idx not in self.patched_blocks:
+            print(f"  Block {block_idx} has no curve attention.")
+            return
+        ca = self.model.model.layers[block_idx].self_attn.curve_attention
+        orig_eval = ca.eval_curve
+
+        def make_scaled(orig, h, s):
+            def scaled(coeffs, tau_01):
+                if coeffs.dim() == 4 and coeffs.shape[1] > h:
+                    c = coeffs.clone()
+                    c[:, h, :, :] *= s
+                    return orig(c, tau_01)
+                return orig(coeffs, tau_01)
+            return scaled
+
+        ca.eval_curve = make_scaled(orig_eval, head_idx, scale)
+
+        # Store for restoration
+        if not hasattr(self, '_scale_patches'):
+            self._scale_patches = []
+        self._scale_patches.append((ca, orig_eval))
+        print(f"  Scaled Layer {block_idx} Head {head_idx} × {scale}")
+
+    def clear_scales(self):
+        """Remove all head scaling."""
+        if hasattr(self, '_scale_patches'):
+            for ca, orig in self._scale_patches:
+                ca.eval_curve = orig
+            self._scale_patches = []
+            print("  Scales cleared.")
+
     def _apply_all_interventions(self):
         """Patch all blocks that have interventions. Returns list of (ca, orig_eval) to restore."""
         import torch
@@ -1578,13 +1615,13 @@ class LiveSimulation(Simulation):
                 do_sample=False, use_cache=False,
                 pad_token_id=self.tokenizer.eos_token_id)
 
-        self._restore_patches(patches)
-
         gen_ids = out[0, prompt_len:]
         self.generated_tokens = [self.tokenizer.decode([tid]).strip() for tid in gen_ids]
         self.gen_step = len(self.generated_tokens)
-        # Run full output through hooks — pass raw IDs to avoid double-encoding
+        # Run display pass WITH interventions still active
         self._run_with_ids(out, text, block_idx=0)
+        # Now restore
+        self._restore_patches(patches)
 
     def run_with_intervention(self, text, block_idx, head, token_idx, edited_coeffs):
         """Re-run forward pass with and without intervention. Returns (orig, mod) top predictions."""
@@ -2966,6 +3003,13 @@ Commands (type in terminal while inspector runs):
             return {"action": "status"}
         if cmd in ("sensitivity", "sens"):
             return {"action": "sensitivity"}
+        # scale <block> <head> <factor>  — e.g. "scale 0 3 -1"
+        m = re.match(r"scale\s+(\d+)\s+(\d+)\s+([-\d.]+)", cmd)
+        if m:
+            return {"action": "scale", "block": int(m.group(1)),
+                    "head": int(m.group(2)), "scale": float(m.group(3))}
+        if cmd in ("clear scales", "clear scale", "unscale"):
+            return {"action": "clear_scales"}
         if cmd in ("list", "ls"):
             return {"action": "list"}
 
@@ -3511,6 +3555,13 @@ class Inspector:
 
             elif act == "quit":
                 return False
+
+            elif act == "scale":
+                self.simulation.scale_head(
+                    parsed["block"], parsed["head"], parsed["scale"])
+
+            elif act == "clear_scales":
+                self.simulation.clear_scales()
 
             elif act == "sensitivity":
                 if self.simulation.text:
