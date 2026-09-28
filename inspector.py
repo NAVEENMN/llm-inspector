@@ -1468,19 +1468,19 @@ class LiveSimulation(Simulation):
         # Rank and print
         all_scores.sort(key=lambda x: x[2], reverse=True)
 
-        print(f"\n  {'Rank':>4s}  {'Layer':>5s}  {'Head':>4s}  {'Sensitivity':>11s}  {'Bar'}")
-        print(f"  {'─'*4}  {'─'*5}  {'─'*4}  {'─'*11}  {'─'*20}")
+        print(f"\n  {'#':>3s}  {'Block':>5s}  {'Head':>4s}  {'Score':>9s}  {'':20s}")
+        print(f"  {'─'*3}  {'─'*5}  {'─'*4}  {'─'*9}  {'─'*20}")
 
         max_score = all_scores[0][2] if all_scores else 1.0
         for rank, (bi, h, score) in enumerate(all_scores[:20]):
             bar_len = int(20 * score / max_score)
             bar = '█' * bar_len + '░' * (20 - bar_len)
-            print(f"  {rank+1:>4d}  {bi:>5d}  {h:>4d}  {score:>11.6f}  {bar}")
+            print(f"  {rank+1:>3d}  {bi:>5d}  {h:>4d}  {score:>9.4f}  {bar}")
 
         if all_scores:
             top_bi, top_h, _ = all_scores[0]
-            print(f"\n  Most sensitive: Layer {top_bi}, Head {top_h}")
-            print(f"  Select it: click block {top_bi}, then head {top_h}")
+            print(f"\n  Most sensitive: Block {top_bi}, Head {top_h}")
+            print(f"  To steer: scale {top_bi} {top_h} -1")
 
         return all_scores
 
